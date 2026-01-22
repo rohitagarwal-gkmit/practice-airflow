@@ -1,0 +1,5 @@
+.venv
+simple_auth_manager_passwords*
+airflow.db*
+logs/
+__pycache__/
