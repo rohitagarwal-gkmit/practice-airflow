@@ -6,7 +6,7 @@ from airflow.providers.standard.operators.bash import BashOperator
 
 # The DAG object; we'll need this to instantiate a DAG
 from airflow.sdk import DAG
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.task.trigger_rule import TriggerRule
 
 
 # Add logging and callbacks for maintenance
@@ -34,7 +34,6 @@ with DAG(
     start_date=datetime(2021, 1, 1),
     catchup=False,
     tags=["example", "production-ready"],
-    sla_miss_callback=on_failure_callback,  # Alert on SLA misses
 ) as dag:
     t1 = BashOperator(
         task_id="print_date",
