@@ -73,7 +73,7 @@ def practice_task_2_etl():
 
         logger.info("Extracting data...")
         hook = PostgresHook(source_postgres_conn_id)
-        records = hook.get_pandas_df("SELECT * FROM source.books;")
+        records = hook.get_pandas_df("SELECT * FROM books;")
 
         logger.info(f"Extracted {len(records)} records.")
 
@@ -124,24 +124,59 @@ def practice_task_2_etl():
         ].copy()
         product_prices_df["currency"] = "GBP"
         product_prices_df = product_prices_df.drop_duplicates(subset=["product_link"])
+        product_prices_df["price_excl_tax"] = (
+            product_prices_df["price_excl_tax"].str.replace("£", "").astype(float)
+        )
+        product_prices_df["price_incl_tax"] = (
+            product_prices_df["price_incl_tax"].str.replace("£", "").astype(float)
+        )
+        product_prices_df["tax"] = (
+            product_prices_df["tax"].str.replace("£", "").astype(float)
+        )
         logger.info(f"Extracted {len(product_prices_df)} product prices.")
 
         # 5. Transform product inventory
         product_inventory_df = data[["product_link", "availability"]].copy()
-        product_inventory_df = product_inventory_df.rename(
-            columns={"availability": "availability_status"}
+        product_inventory_df["availability_count"] = (
+            product_inventory_df["availability"]
+            .str.replace("In stock (", "")
+            .str.replace(" available)", "")
+            .str.strip()
         )
         product_inventory_df = product_inventory_df.dropna(
-            subset=["availability_status"]
+            subset=["availability_count"]
         )
         product_inventory_df = product_inventory_df.drop_duplicates(
             subset=["product_link"]
         )
+        product_inventory_df["availability_count"] = product_inventory_df[
+            "availability_count"
+        ].astype(float)
+        product_inventory_df["availability_status"] = product_inventory_df[
+            "availability_count"
+        ].apply(lambda x: "In Stock" if x > 0 else "Out of Stock")
+        product_inventory_df = product_inventory_df[
+            ["product_link", "availability_status", "availability_count"]
+        ]
         logger.info(f"Extracted {len(product_inventory_df)} inventory records.")
 
         # 6. Transform ratings
         ratings_df = data[["product_link", "rating"]].copy()
         ratings_df = ratings_df.rename(columns={"rating": "rating_value"})
+        for index, row in ratings_df.iterrows():
+            rating_str = row["rating_value"]
+            if rating_str == "One":
+                ratings_df.at[index, "rating_value"] = 1
+            elif rating_str == "Two":
+                ratings_df.at[index, "rating_value"] = 2
+            elif rating_str == "Three":
+                ratings_df.at[index, "rating_value"] = 3
+            elif rating_str == "Four":
+                ratings_df.at[index, "rating_value"] = 4
+            elif rating_str == "Five":
+                ratings_df.at[index, "rating_value"] = 5
+            else:
+                ratings_df.at[index, "rating_value"] = None
         ratings_df = ratings_df.dropna(subset=["rating_value"])
         ratings_df = ratings_df.drop_duplicates(subset=["product_link"])
         logger.info(f"Extracted {len(ratings_df)} ratings.")
@@ -150,6 +185,9 @@ def practice_task_2_etl():
         reviews_summary_df = data[["product_link", "number_of_reviews"]].copy()
         reviews_summary_df = reviews_summary_df.dropna(subset=["number_of_reviews"])
         reviews_summary_df = reviews_summary_df.drop_duplicates(subset=["product_link"])
+        reviews_summary_df["number_of_reviews"] = reviews_summary_df[
+            "number_of_reviews"
+        ].astype(int)
         logger.info(f"Extracted {len(reviews_summary_df)} review summaries.")
 
         transformed_data = {
@@ -167,7 +205,7 @@ def practice_task_2_etl():
 
     @task(task_id="load_data", pool="default_pool")
     def load_data(transformed_data: dict) -> dict:
-        """Load transformed data into the target system.
+        """Load transformed data into the target system with transaction support.
 
         Args:
             transformed_data: Dictionary containing normalized DataFrames for each target table.
@@ -175,45 +213,170 @@ def practice_task_2_etl():
         Returns:
             dict: Summary of the load operation.
         """
-        logger.info("Loading data...")
         hook = PostgresHook(postgres_conn_id=target_postgres_conn_id)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
 
         summary = {}
 
-        # Load in proper order to respect foreign key constraints
-        load_order = [
-            ("categories", "target.categories"),
-            ("products", "target.products"),
-            ("product_images", "target.product_images"),
-            ("product_prices", "target.product_prices"),
-            ("product_inventory", "target.product_inventory"),
-            ("ratings", "target.ratings"),
-            ("reviews_summary", "target.reviews_summary"),
-        ]
+        try:
+            # Start transaction
+            logger.info("Starting transaction for data load...")
 
-        for table_key, table_name in load_order:
-            df = transformed_data.get(table_key)
-            if df is not None and not df.empty:
-                logger.info(f"Loading {len(df)} records to {table_name}...")
+            # 1. Load categories
+            categories_df = transformed_data.get("categories")
+            if categories_df is not None and not categories_df.empty:
+                logger.info(f"Loading {len(categories_df)} categories...")
+                for _, row in categories_df.iterrows():
+                    cursor.execute(
+                        "INSERT INTO target.categories (category_name) VALUES (%s) ON CONFLICT (category_name) DO NOTHING",
+                        (row["category_name"],),
+                    )
+                summary["target.categories"] = len(categories_df)
+                logger.info(f"Loaded {len(categories_df)} categories.")
 
-                # Insert data using PostgresHook
-                hook.insert_rows(
-                    table=table_name,
-                    rows=df.values.tolist(),
-                    target_fields=df.columns.tolist(),
-                    replace=False,
-                    replace_index=None,
-                )
+            # 2. Load products and get product_id mapping
+            products_df = transformed_data.get("products")
+            product_link_to_id = {}
 
-                summary[table_name] = len(df)
-                logger.info(f"Successfully loaded {len(df)} records to {table_name}.")
-            else:
-                logger.warning(f"No data to load for {table_name}.")
-                summary[table_name] = 0
+            if products_df is not None and not products_df.empty:
+                logger.info(f"Loading {len(products_df)} products...")
+                for _, row in products_df.iterrows():
+                    cursor.execute(
+                        """
+                        INSERT INTO target.products (title, product_link, upc, product_type, description, category_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (product_link) DO UPDATE 
+                        SET title = EXCLUDED.title
+                        RETURNING product_id, product_link
+                        """,
+                        (
+                            row["title"],
+                            row["product_link"],
+                            row["upc"],
+                            row["product_type"],
+                            row["description"],
+                            row["category_id"],
+                        ),
+                    )
+                    result = cursor.fetchone()
+                    product_link_to_id[result[1]] = result[0]
 
-        logger.info("Data load complete.")
-        logger.info(f"Load summary: {summary}")
-        return {"status": "success", "tables_loaded": summary}
+                summary["target.products"] = len(products_df)
+                logger.info(f"Loaded {len(products_df)} products.")
+
+            # 3. Load product_images (with product_id)
+            product_images_df = transformed_data.get("product_images")
+            if product_images_df is not None and not product_images_df.empty:
+                logger.info(f"Loading {len(product_images_df)} product images...")
+                loaded_count = 0
+                for _, row in product_images_df.iterrows():
+                    product_id = product_link_to_id.get(row["product_link"])
+                    if product_id:
+                        cursor.execute(
+                            "INSERT INTO target.product_images (product_id, image_link) VALUES (%s, %s)",
+                            (product_id, row["image_link"]),
+                        )
+                        loaded_count += 1
+                summary["target.product_images"] = loaded_count
+                logger.info(f"Loaded {loaded_count} product images.")
+
+            # 4. Load product_prices (with product_id)
+            product_prices_df = transformed_data.get("product_prices")
+            if product_prices_df is not None and not product_prices_df.empty:
+                logger.info(f"Loading {len(product_prices_df)} product prices...")
+                loaded_count = 0
+                for _, row in product_prices_df.iterrows():
+                    product_id = product_link_to_id.get(row["product_link"])
+                    if product_id:
+                        cursor.execute(
+                            """
+                            INSERT INTO target.product_prices 
+                            (product_id, price_excl_tax, price_incl_tax, tax, currency)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (
+                                product_id,
+                                row["price_excl_tax"],
+                                row["price_incl_tax"],
+                                row["tax"],
+                                row["currency"],
+                            ),
+                        )
+                        loaded_count += 1
+                summary["target.product_prices"] = loaded_count
+                logger.info(f"Loaded {loaded_count} product prices.")
+
+            # 5. Load product_inventory (with product_id)
+            product_inventory_df = transformed_data.get("product_inventory")
+            if product_inventory_df is not None and not product_inventory_df.empty:
+                logger.info(f"Loading {len(product_inventory_df)} inventory records...")
+                loaded_count = 0
+                for _, row in product_inventory_df.iterrows():
+                    product_id = product_link_to_id.get(row["product_link"])
+                    if product_id:
+                        cursor.execute(
+                            """
+                            INSERT INTO target.product_inventory (product_id, availability_status)
+                            VALUES (%s, %s)
+                            """,
+                            (product_id, row["availability_status"]),
+                        )
+                        loaded_count += 1
+                summary["target.product_inventory"] = loaded_count
+                logger.info(f"Loaded {loaded_count} inventory records.")
+
+            # 6. Load ratings (with product_id)
+            ratings_df = transformed_data.get("ratings")
+            if ratings_df is not None and not ratings_df.empty:
+                logger.info(f"Loading {len(ratings_df)} ratings...")
+                loaded_count = 0
+                for _, row in ratings_df.iterrows():
+                    product_id = product_link_to_id.get(row["product_link"])
+                    if product_id:
+                        cursor.execute(
+                            "INSERT INTO target.ratings (product_id, rating_value) VALUES (%s, %s)",
+                            (product_id, row["rating_value"]),
+                        )
+                        loaded_count += 1
+                summary["target.ratings"] = loaded_count
+                logger.info(f"Loaded {loaded_count} ratings.")
+
+            # 7. Load reviews_summary (with product_id)
+            reviews_summary_df = transformed_data.get("reviews_summary")
+            if reviews_summary_df is not None and not reviews_summary_df.empty:
+                logger.info(f"Loading {len(reviews_summary_df)} review summaries...")
+                loaded_count = 0
+                for _, row in reviews_summary_df.iterrows():
+                    product_id = product_link_to_id.get(row["product_link"])
+                    if product_id:
+                        cursor.execute(
+                            """
+                            INSERT INTO target.reviews_summary (product_id, number_of_reviews)
+                            VALUES (%s, %s)
+                            """,
+                            (product_id, row["number_of_reviews"]),
+                        )
+                        loaded_count += 1
+                summary["target.reviews_summary"] = loaded_count
+                logger.info(f"Loaded {loaded_count} review summaries.")
+
+            # Commit transaction
+            conn.commit()
+            logger.info("Transaction committed successfully.")
+            logger.info(f"Load summary: {summary}")
+
+            return {"status": "success", "tables_loaded": summary}
+
+        except Exception as e:
+            # Rollback on failure
+            conn.rollback()
+            logger.error(f"Error during data load. Rolling back transaction: {e}")
+            raise
+
+        finally:
+            cursor.close()
+            conn.close()
 
     # Define task dependencies
     schema_check = check_or_create_target_schema()
