@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS target.product_inventory (
     inventory_id        BIGSERIAL PRIMARY KEY,
     product_id          BIGINT NOT NULL,
     availability_status TEXT NOT NULL,
+    availability_count  INTEGER,
 
     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
