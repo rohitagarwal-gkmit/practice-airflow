@@ -2,6 +2,7 @@ import os
 from airflow.sdk import dag, task
 from datetime import datetime, timedelta
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.smtp.operators.smtp import EmailOperator
 from logging import getLogger
 import pandas as pd
 
@@ -11,7 +12,12 @@ source_postgres_conn_id = "source_postgres"
 
 
 def on_failure_callback(context):
-    print(f"Task {context['task_instance_key_str']} failed. Alerting...")
+    """Callback function to be called on task failure.
+
+    as well as raise email of failure.
+    """
+
+    logger.error(f"Task {context['task_instance'].task_id} failed.")
 
 
 @dag(
@@ -378,11 +384,52 @@ def practice_task_2_etl():
             cursor.close()
             conn.close()
 
+    @task(task_id="get_email_data", pool="default_pool")
+    def get_email_data(load_result: dict) -> dict:
+        """Prepare email content based on load result."""
+        try:
+            tables_loaded = (
+                load_result.get("tables_loaded", {})
+                if isinstance(load_result, dict)
+                else {}
+            )
+
+            subject = "Airflow: practice_task_2_etl succeeded"
+            body = (
+                """<strong>Congratulations!</strong>\n\n
+                <div>The ETL DAG <code>practice_task_2_etl</code> has completed successfully.</div>\n\n
+                <br>
+                <div>Tables loaded:</div>
+                <ul>"""
+                + "".join(
+                    f"<li>{table}: {count} records</li>"
+                    for table, count in tables_loaded.items()
+                )
+                + """</ul>"""
+            )
+
+            return {
+                "status": "success",
+                "email_data": {"subject": subject, "body": body},
+            }
+        except Exception as e:
+            logger.error(f"Failed to send email notification via connection: {e}")
+            return {"status": "error"}
+
     # Define task dependencies
     schema_check = check_or_create_target_schema()
     extracted_data = extract_data()
     transformed_data = transform_data(extracted_data)
-    load_data(transformed_data)
+    load_result = load_data(transformed_data)
+    email_data = get_email_data(load_result)
+
+    email_data >> EmailOperator(
+        task_id="send_email_notification",
+        to="rohitagarwal@gkmit.co",
+        subject="{{ ti.xcom_pull(task_ids='get_email_data')['email_data']['subject'] }}",
+        html_content="{{ ti.xcom_pull(task_ids='get_email_data')['email_data']['body'] }}",
+        trigger_rule="all_success",
+    )
 
     schema_check >> extracted_data
 
